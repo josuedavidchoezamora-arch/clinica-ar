@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#1c1a17">
+  <title>Clínica – Realidad Aumentada</title>
+  <style>
+    :root {
+      --bg: #1c1a17;
+      --panel: #26231f;
+      --text: #f4efe6;
+      --muted: #b9b0a2;
+      --accent: #c8955a;
+      --accent-ink: #1c1a17;
+      --warn: #f2c14e;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden; -webkit-tap-highlight-color: transparent;
+    }
+    #ar { position: fixed; inset: 0; }
+    .screen {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom));
+      background: var(--bg); text-align: center;
+    }
+    .screen[hidden] { display: none; }
+    h1 { font-size: 1.6rem; font-weight: 650; margin: 0 0 6px; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); margin: 0 0 28px; font-size: 0.95rem; }
+    ol { text-align: left; margin: 0 0 32px; padding-left: 1.4em; line-height: 1.9; max-width: 320px; }
+    button {
+      appearance: none; border: 0; border-radius: 14px; padding: 16px 36px;
+      font: 600 1.1rem/1 inherit; background: var(--accent); color: var(--accent-ink);
+      cursor: pointer; touch-action: manipulation; user-select: none;
+      transition: transform 120ms ease-out;
+    }
+    button:active { transform: scale(0.97); }
+    button.secondary { background: transparent; color: var(--text); border: 1px solid #5a5248; margin-top: 12px; }
+    .note { color: var(--muted); font-size: 0.85rem; margin-top: 20px; max-width: 340px; }
+    #status { margin-top: 16px; min-height: 1.2em; color: var(--muted); font-size: 0.9rem; }
+    #inapp { z-index: 20; }
+    #inapp .icon { font-size: 2.4rem; margin-bottom: 8px; color: var(--warn); }
+    #hint {
+      position: fixed; left: 50%; bottom: max(28px, env(safe-area-inset-bottom)); transform: translateX(-50%);
+      z-index: 5; background: rgba(28, 26, 23, 0.82); color: var(--text);
+      padding: 12px 18px; border-radius: 999px; font-size: 0.95rem; white-space: nowrap;
+      transition: opacity 200ms ease-out; pointer-events: none;
+    }
+    #hint.off { opacity: 0; }
+    #ar video { object-fit: cover; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="ar"></div>
+  <div id="hint" class="off">Apunta la cámara al plano impreso</div>
+
+  <section id="start" class="screen">
+    <h1>Clínica – Realidad Aumentada</h1>
+    <p class="sub">Modelo 3D sobre el plano impreso</p>
+    <ol>
+      <li>Coloca la hoja sobre una mesa con buena luz.</li>
+      <li>Pulsa <b>Iniciar AR</b> y permite la cámara.</li>
+      <li>Apunta al plano completo, a unos 30–40 cm.</li>
+    </ol>
+    <button id="btnStart" type="button">Iniciar AR</button>
+    <div id="status" role="status"></div>
+  </section>
+
+  <section id="inapp" class="screen" hidden>
+    <div class="icon">⚠</div>
+    <h1>Ábrelo en tu navegador</h1>
+    <p class="sub" id="inappMsg">Este navegador interno no permite usar la cámara para realidad aumentada.</p>
+    <button id="btnOpen" type="button">Abrir en Chrome</button>
+    <button id="btnCopy" class="secondary" type="button">Copiar enlace</button>
+    <button id="btnAnyway" class="secondary" type="button">Intentar aquí de todos modos</button>
+  </section>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { MindARThree } from 'mindar-image-three';
+
+    const $ = (id) => document.getElementById(id);
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const isAndroid = /Android/i.test(ua);
+
+    // In-app browsers (Instagram, Facebook, TikTok, WhatsApp, etc.) often block getUserMedia.
+    const inApp = /Instagram|FBAN|FBAV|FB_IAB|TikTok|musical_ly|Bytedance|BytedanceWebview|WhatsApp|Snapchat|Line\/|LinkedInApp|MicroMessenger|Twitter/i.test(ua);
+    if (inApp) {
+      $('inapp').hidden = false;
+      $('inappMsg').textContent = isIOS
+        ? 'Toca ••• o el ícono de compartir y elige "Abrir en Safari". Este navegador interno no permite la cámara para AR.'
+        : 'Toca ⋮ y elige "Abrir en Chrome", o usa el botón de abajo. Este navegador interno no permite la cámara para AR.';
+      $('btnOpen').textContent = isIOS ? 'Copiar enlace para Safari' : 'Abrir en Chrome';
+    }
+    $('btnOpen').onclick = () => {
+      if (isAndroid) {
+        const u = location.href.replace(/^https?:\/\//, '');
+        location.href = `intent://${u}#Intent;scheme=https;package=com.android.chrome;end`;
+      } else {
+        copyLink();
+      }
+    };
+    $('btnCopy').onclick = copyLink;
+    $('btnAnyway').onclick = () => { $('inapp').hidden = true; };
+    async function copyLink() {
+      try { await navigator.clipboard.writeText(location.href); toast('Enlace copiado. Pégalo en Safari o Chrome.'); }
+      catch { prompt('Copia este enlace y ábrelo en Safari o Chrome:', location.href); }
+    }
+    function toast(msg) { $('inappMsg').textContent = msg; }
+
+    // Keep any camera <video> inline on iOS (MindAR creates it at start).
+    new MutationObserver(() => {
+      document.querySelectorAll('video').forEach(v => {
+        v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', ''); v.muted = true;
+      });
+    }).observe(document.body, { childList: true, subtree: true });
+
+    const status = (t) => { $('status').textContent = t; };
+
+    // Preload the model while the user reads the instructions.
+    const modelPromise = new GLTFLoader().loadAsync('./clinica.glb');
+
+    let started = false;
+    $('btnStart').addEventListener('click', async () => {
+      if (started) return;
+      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+        status('La cámara requiere HTTPS y un navegador compatible (Safari o Chrome).');
+        return;
+      }
+      started = true;
+      $('btnStart').disabled = true;
+      status('Cargando modelo y cámara…');
+      try {
+        await startAR();
+        $('start').hidden = true;
+      } catch (err) {
+        console.error(err);
+        started = false;
+        $('btnStart').disabled = false;
+        const denied = err && (err.name === 'NotAllowedError' || /denied|permission/i.test(String(err)));
+        status(denied
+          ? 'Permiso de cámara denegado. Actívalo en los ajustes del navegador y vuelve a intentar.'
+          : 'No se pudo iniciar la cámara: ' + (err.message || err));
+      }
+    }, { passive: true });
+
+    async function startAR() {
+      const mindarThree = new MindARThree({
+        container: $('ar'),
+        imageTargetSrc: './marcador.mind',
+        uiLoading: 'no', uiScanning: 'no', uiError: 'no',
+        filterMinCF: 0.0001, filterBeta: 0.001,
+        missTolerance: 5, warmupTolerance: 5,
+      });
+      const { renderer, scene, camera } = mindarThree;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.1;
+
+      scene.add(new THREE.HemisphereLight(0xfff6ea, 0x6b5b4a, 1.6));
+      const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+      sun.position.set(0.4, 0.8, 1.2);
+      scene.add(sun);
+
+      const anchor = mindarThree.addAnchor(0);
+      const gltf = await modelPromise;
+      const model = gltf.scene;
+
+      // glTF is +Y up; the MindAR target lies in its XY plane with +Z toward the viewer.
+      // Rotating +90° about X puts the floor on the paper and the plan's "north" (+Y) up the page.
+      model.rotation.x = Math.PI / 2;
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const s = 1 / size.x;               // model width = target width (1 unit in MindAR)
+      const fit = new THREE.Group();      // static fit/alignment
+      model.position.set(-center.x, -center.y, -box.min.z);
+      fit.add(model);
+      fit.scale.setScalar(s);
+
+      const intro = new THREE.Group();    // animated entrance
+      intro.add(fit);
+      anchor.group.add(intro);
+      intro.visible = false;
+
+      let t0 = null;
+      const DURATION = 1.4;
+      const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+      anchor.onTargetFound = () => { t0 = performance.now(); intro.visible = true; $('hint').classList.add('off'); };
+      anchor.onTargetLost = () => { $('hint').classList.remove('off'); };
+
+      await mindarThree.start();
+      $('hint').classList.remove('off');
+
+      renderer.setAnimationLoop(() => {
+        if (t0 !== null) {
+          const p = Math.min((performance.now() - t0) / 1000 / DURATION, 1);
+          const e = easeOut(p);
+          intro.position.z = (1 - e) * -0.25;          // rises out of the paper
+          intro.rotation.z = (1 - e) * -Math.PI / 2;    // gentle quarter turn into place
+          intro.scale.setScalar(0.85 + 0.15 * e);
+          if (p >= 1) t0 = null;
+        }
+        renderer.render(scene, camera);
+      });
+    }
+  </script>
+</body>
+</html>
