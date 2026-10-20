@@ -74,6 +74,7 @@
       <li>Coloca la hoja sobre una mesa con buena luz.</li>
       <li>Pulsa <b>Iniciar AR</b> y permite la cámara.</li>
       <li>Apunta al plano completo, a unos 30–40 cm.</li>
+      <li>Rodea la hoja despacio para verlo desde otros lados.</li>
     </ol>
     <button id="btnStart" type="button">Iniciar AR</button>
     <div id="status" role="status"></div>
@@ -135,6 +136,26 @@
     // Preload the model while the user reads the instructions.
     const modelPromise = new GLTFLoader().loadAsync('./clinica.glb');
 
+    // Device orientation -> camera quaternion (same math as three.js DeviceOrientationControls).
+    // Used to keep the model fixed in space while the printed plan is out of view.
+    const gyro = {
+      q: new THREE.Quaternion(), ok: false, listening: false,
+      enable(allowed) {
+        if (!allowed || this.listening) return;
+        this.listening = true;
+        const euler = new THREE.Euler(), zee = new THREE.Vector3(0, 0, 1);
+        const q0 = new THREE.Quaternion(), q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+        window.addEventListener('deviceorientation', (e) => {
+          if (e.alpha === null) return;
+          const d = THREE.MathUtils.DEG2RAD;
+          const orient = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * d;
+          euler.set(e.beta * d, e.alpha * d, -e.gamma * d, 'YXZ');
+          this.q.setFromEuler(euler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -orient));
+          this.ok = true;
+        });
+      },
+    };
+
     let started = false;
     $('btnStart').addEventListener('click', async () => {
       if (started) return;
@@ -144,7 +165,13 @@
       }
       started = true;
       $('btnStart').disabled = true;
+      // iOS only grants motion sensors from a user tap; ask before any other await.
+      const motionPermission = (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function')
+        ? DeviceOrientationEvent.requestPermission().catch(() => 'denied')
+        : Promise.resolve('granted');
       status('Cargando modelo y cámara…');
+      gyro.enable(await motionPermission === 'granted');
       try {
         await startAR();
         $('start').hidden = true;
@@ -164,8 +191,8 @@
         container: $('ar'),
         imageTargetSrc: './marcador.mind',
         uiLoading: 'no', uiScanning: 'no', uiError: 'no',
-        filterMinCF: 0.0001, filterBeta: 0.001,
-        missTolerance: 5, warmupTolerance: 5,
+        // MindAR's default One-Euro filter (minCF 0.001, beta 1000): responsive, no lag when the phone turns.
+        missTolerance: 5, warmupTolerance: 3,
       });
       const { renderer, scene, camera } = mindarThree;
       renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -194,21 +221,73 @@
       fit.add(model);
       fit.scale.setScalar(s);
 
-      const intro = new THREE.Group();    // animated entrance
+      const intro = new THREE.Group();    // animated entrance (plays once)
       intro.add(fit);
-      anchor.group.add(intro);
-      intro.visible = false;
 
-      let t0 = null;
-      const DURATION = 1.4;
+      // The model lives in its own holder instead of inside anchor.group, so it can stay
+      // put (gyro-compensated) while MindAR has lost the printed plan.
+      const holder = new THREE.Group();
+      holder.matrixAutoUpdate = false;
+      holder.visible = false;
+      holder.add(intro);
+      scene.add(holder);
+      window.__ar = { anchor, holder, gyro };
+
+      const lastPose = new THREE.Matrix4();   // last tracked pose (camera space)
+      const qAtLast = new THREE.Quaternion(); // device orientation when it was tracked
+      const heldPose = new THREE.Matrix4();   // pose shown while tracking is lost
+      let hasPose = false, wasTracked = false, blendStart = 0;
+      let t0 = null, introDone = false;
+      const DURATION = 1.4, BLEND_MS = 250;
       const easeOut = (x) => 1 - Math.pow(1 - x, 3);
-      anchor.onTargetFound = () => { t0 = performance.now(); intro.visible = true; $('hint').classList.add('off'); };
-      anchor.onTargetLost = () => { $('hint').classList.remove('off'); };
+      const pA = new THREE.Vector3(), pB = new THREE.Vector3(), sA = new THREE.Vector3(), sB = new THREE.Vector3();
+      const qA = new THREE.Quaternion(), qB = new THREE.Quaternion(), dq = new THREE.Quaternion();
+      const rot = new THREE.Matrix4();
+
+      const hint = (text) => {
+        if (text) { $('hint').textContent = text; $('hint').classList.remove('off'); }
+        else $('hint').classList.add('off');
+      };
 
       await mindarThree.start();
-      $('hint').classList.remove('off');
+      hint('Apunta la cámara al plano impreso');
 
       renderer.setAnimationLoop(() => {
+        const tracked = anchor.group.visible;
+        if (tracked) {
+          if (!wasTracked) {
+            blendStart = hasPose ? performance.now() : 0;   // smooth re-anchor from the held pose
+            if (!introDone) { t0 = performance.now(); introDone = true; }
+            hint(null);
+          }
+          lastPose.copy(anchor.group.matrix);
+          qAtLast.copy(gyro.q);
+          hasPose = true;
+          const k = blendStart ? Math.min((performance.now() - blendStart) / BLEND_MS, 1) : 1;
+          if (k < 1) {
+            heldPose.decompose(pA, qA, sA);
+            lastPose.decompose(pB, qB, sB);
+            pA.lerp(pB, k); qA.slerp(qB, k); sA.lerp(sB, k);
+            holder.matrix.compose(pA, qA, sA);
+          } else {
+            holder.matrix.copy(lastPose);
+          }
+          holder.visible = true;
+        } else if (hasPose && gyro.ok) {
+          // Camera rotated by D = qAtLast^-1 * qNow since the last tracked frame;
+          // a world-fixed object therefore appears rotated by D^-1 in camera space.
+          dq.copy(qAtLast).invert().multiply(gyro.q).invert();
+          heldPose.copy(rot.makeRotationFromQuaternion(dq).multiply(lastPose));
+          holder.matrix.copy(heldPose);
+          holder.visible = true;
+          if (wasTracked) hint('Vuelve a enfocar el plano para reajustar');
+        } else {
+          holder.visible = false;
+          if (wasTracked) hint('Apunta la cámara al plano impreso');
+        }
+        if (!tracked) heldPose.copy(holder.matrix);
+        wasTracked = tracked;
+
         if (t0 !== null) {
           const p = Math.min((performance.now() - t0) / 1000 / DURATION, 1);
           const e = easeOut(p);
